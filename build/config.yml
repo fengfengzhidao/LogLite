@@ -11,7 +11,7 @@ info:
   description: "Lightweight local log viewer" # The application description
   copyright: "(c) 2026, gzh_study" # Copyright text
   comments: "LogLite local log viewer" # Comments
-  version: "0.0.1" # The application version
+  version: "0.1.0" # The application version
 
 # Dev mode configuration
 dev_mode:
