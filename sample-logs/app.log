@@ -1,0 +1,10 @@
+2026-05-21 10:13:58 INFO  service booting env=local
+2026-05-21 10:14:00 INFO  request started method=GET path=/api/orders trace=demo-1001
+2026-05-21 10:14:01 DEBUG loading order cache key=orders:recent
+2026-05-21 10:14:02 WARN  database connection retry attempt=1
+2026-05-21 10:14:03 ERROR failed to connect database host=127.0.0.1:5432
+2026-05-21 10:14:04 INFO  request finished status=500 cost=126ms trace=demo-1001
+2026-05-21 10:15:11 INFO  request started method=POST path=/api/login trace=demo-1002
+2026-05-21 10:15:12 INFO  request finished status=200 cost=32ms trace=demo-1002
+2026-05-21 10:16:30 WARN  slow query detected cost=834ms sql=select_orders
+2026-05-21 10:17:00 INFO  scheduler heartbeat ok

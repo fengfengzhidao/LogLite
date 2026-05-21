@@ -1,0 +1,7 @@
+2026-05-21 11:02:01 INFO  worker started queue=mail
+2026-05-21 11:02:05 INFO  job picked id=job-001 type=email
+2026-05-21 11:02:06 ERROR send email failed provider=mockmail reason=timeout
+2026-05-21 11:02:08 WARN  job retry scheduled id=job-001 delay=10s
+2026-05-21 11:02:18 INFO  job picked id=job-001 type=email
+2026-05-21 11:02:19 INFO  job completed id=job-001 cost=41ms
+2026-05-21 11:03:10 DEBUG queue depth=0
