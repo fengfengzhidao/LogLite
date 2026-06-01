@@ -251,6 +251,35 @@ export class MultiSearchResult {
     }
 }
 
+export class RemoteServer {
+    "name": string;
+    "address": string;
+    "token": string;
+
+    /** Creates a new RemoteServer instance. */
+    constructor($$source: Partial<RemoteServer> = {}) {
+        if (!("name" in $$source)) {
+            this["name"] = "";
+        }
+        if (!("address" in $$source)) {
+            this["address"] = "";
+        }
+        if (!("token" in $$source)) {
+            this["token"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new RemoteServer instance from a string or object.
+     */
+    static createFrom($$source: any = {}): RemoteServer {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new RemoteServer($$parsedSource as Partial<RemoteServer>);
+    }
+}
+
 export class SearchHit {
     "lineNumber": number;
     "matchLines": number[];

@@ -1,8 +1,11 @@
+//go:build !logliteagent
+
 package main
 
 import (
 	"embed"
 	"log"
+	"os"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
@@ -12,6 +15,13 @@ import (
 var assets embed.FS
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "agent" {
+		if err := runAgent(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
 	app := application.New(application.Options{
 		Name:        "LogLite",
 		Description: "Lightweight local log viewer",

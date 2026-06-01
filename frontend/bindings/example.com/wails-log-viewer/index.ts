@@ -13,6 +13,7 @@ export {
     LogFile,
     LogLine,
     MultiSearchResult,
+    RemoteServer,
     SearchHit,
     SearchOptions,
     SearchResult,

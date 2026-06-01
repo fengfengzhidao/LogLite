@@ -86,6 +86,12 @@ type TailUpdateResult = {
   warning: string
 }
 
+type RemoteServer = {
+  name: string
+  address: string
+  token: string
+}
+
 type TextPart = {
   text: string
   matched: boolean
@@ -115,8 +121,15 @@ const isDarkMode = ref(false)
 const tailing = ref(false)
 const tailPaused = ref(false)
 const tailOffset = ref(0)
+const sourceMode = ref<'local' | 'remote'>('local')
+const remoteServer = ref<RemoteServer>({
+  name: '测试环境',
+  address: 'http://127.0.0.1:8089',
+  token: 'loglite-demo',
+})
 let removeDropListener: (() => void) | null = null
 let tailTimer: number | null = null
+let remoteTailSocket: WebSocket | null = null
 
 const selectedLines = computed(() => {
   const lines = content.value?.lines ?? []
@@ -223,8 +236,24 @@ async function chooseDirectory() {
   }
 }
 
+function switchSource(mode: 'local' | 'remote') {
+  if (sourceMode.value === mode) return
+  sourceMode.value = mode
+  directory.value = ''
+  files.value = []
+  warnings.value = []
+  activeFile.value = null
+  content.value = null
+  searchResult.value = null
+  multiSearchResult.value = null
+  stopTail()
+  if (mode === 'remote') {
+    searchScope.value = 'current'
+  }
+}
+
 async function scanDirectory() {
-  if (!directory.value || loadingFiles.value) return
+  if ((sourceMode.value === 'local' && !directory.value) || loadingFiles.value) return
 
   loadingFiles.value = true
   error.value = ''
@@ -235,7 +264,9 @@ async function scanDirectory() {
   stopTail()
 
   try {
-    const result = (await LogService.ListLogFiles(directory.value)) as LogDirectoryResult
+    const result = sourceMode.value === 'remote'
+      ? (await LogService.ListRemoteLogFiles(remoteServer.value)) as LogDirectoryResult
+      : (await LogService.ListLogFiles(directory.value)) as LogDirectoryResult
     directory.value = result.root
     files.value = result.files
     warnings.value = result.warnings ?? []
@@ -250,7 +281,9 @@ async function scanDirectory() {
 
 async function openFile(file: LogFile) {
   activeFile.value = file
-  directory.value = parentDir(file.path)
+  if (sourceMode.value === 'local') {
+    directory.value = parentDir(file.path)
+  }
   content.value = null
   searchResult.value = null
   multiSearchResult.value = null
@@ -258,7 +291,9 @@ async function openFile(file: LogFile) {
   loadingContent.value = true
 
   try {
-    content.value = (await LogService.ReadTail(file.path, 2000, encoding.value)) as LogContentResult
+    content.value = sourceMode.value === 'remote'
+      ? (await LogService.ReadRemoteTail(remoteServer.value, file.path, 2000, encoding.value)) as LogContentResult
+      : (await LogService.ReadTail(file.path, 2000, encoding.value)) as LogContentResult
     tailOffset.value = content.value.size
   } catch (err) {
     setError(err, '读取日志失败')
@@ -268,6 +303,10 @@ async function openFile(file: LogFile) {
 }
 
 async function openDroppedFiles(paths: string[]) {
+  if (sourceMode.value === 'remote') {
+    error.value = '远程模式请从 agent 文件列表中选择日志'
+    return
+  }
   const logPaths = paths.filter((path) => /\.(log|txt)$/i.test(path))
   if (!logPaths.length) {
     error.value = '只支持拖入 .log / .txt 日志文件'
@@ -322,7 +361,10 @@ async function runSearch() {
 
   try {
     lastSearchOptions.value = options
-    if (searchScope.value === 'all') {
+    if (sourceMode.value === 'remote' && activeFile.value) {
+      searchResult.value = (await LogService.SearchRemoteInFile(remoteServer.value, activeFile.value.path, options)) as SearchResult
+      multiSearchResult.value = null
+    } else if (searchScope.value === 'all') {
       multiSearchResult.value = (await LogService.SearchInFiles(files.value, options)) as MultiSearchResult
       searchResult.value = null
       if (multiSearchResult.value.warnings?.length) {
@@ -443,6 +485,10 @@ function stopTail() {
     window.clearInterval(tailTimer)
     tailTimer = null
   }
+  if (remoteTailSocket) {
+    remoteTailSocket.close()
+    remoteTailSocket = null
+  }
 }
 
 function toggleTail() {
@@ -454,10 +500,80 @@ function toggleTail() {
 
   tailing.value = true
   tailPaused.value = false
+  if (sourceMode.value === 'remote') {
+    startRemoteTail()
+    return
+  }
   tailTimer = window.setInterval(() => {
     void pollTail()
   }, 1200)
   void pollTail()
+}
+
+function toggleTailPause() {
+  if (!tailing.value) return
+  tailPaused.value = !tailPaused.value
+  if (sourceMode.value !== 'remote') return
+  if (tailPaused.value) {
+    remoteTailSocket?.close()
+    remoteTailSocket = null
+  } else {
+    startRemoteTail()
+  }
+}
+
+function startRemoteTail() {
+  if (!activeFile.value) return
+  const address = remoteServer.value.address.trim().replace(/\/+$/, '')
+  const wsAddress = address.replace(/^http:/i, 'ws:').replace(/^https:/i, 'wss:')
+  const query = new URLSearchParams({
+    path: activeFile.value.path,
+    offset: String(tailOffset.value),
+    encoding: encoding.value,
+    token: remoteServer.value.token,
+  })
+  remoteTailSocket = new WebSocket(`${wsAddress}/api/tail/stream?${query}`)
+  remoteTailSocket.onmessage = (event) => {
+    const update = JSON.parse(event.data) as TailUpdateResult & { error?: string }
+    if (update.error) {
+      error.value = `远程 tail 失败：${update.error}`
+      stopTail()
+      return
+    }
+    applyTailUpdate(update)
+  }
+  remoteTailSocket.onerror = () => {
+    error.value = '远程 tail 连接失败'
+    stopTail()
+  }
+  remoteTailSocket.onclose = () => {
+    remoteTailSocket = null
+  }
+}
+
+function applyTailUpdate(update: TailUpdateResult) {
+  if (tailPaused.value) return
+  tailOffset.value = update.size
+  if (update.rotated) {
+    if (activeFile.value) void openFile(activeFile.value)
+    return
+  }
+  if (update.warning) {
+    warnings.value = [update.warning]
+  }
+  if (update.lines.length && content.value) {
+    const base = content.value.lines.length
+    const nextLines = update.lines.map((line, index) => ({
+      ...line,
+      number: base + index + 1,
+    }))
+    content.value = {
+      ...content.value,
+      lines: [...content.value.lines, ...nextLines].slice(-5000),
+      totalRead: Math.min(content.value.totalRead + nextLines.length, 5000),
+      size: update.size,
+    }
+  }
 }
 
 async function pollTail() {
@@ -465,27 +581,7 @@ async function pollTail() {
 
   try {
     const update = (await LogService.ReadTailUpdate(activeFile.value.path, tailOffset.value, encoding.value)) as TailUpdateResult
-    tailOffset.value = update.size
-    if (update.rotated) {
-      await openFile(activeFile.value)
-      return
-    }
-    if (update.warning) {
-      warnings.value = [update.warning]
-    }
-    if (update.lines.length && content.value) {
-      const base = content.value.lines.length
-      const nextLines = update.lines.map((line, index) => ({
-        ...line,
-        number: base + index + 1,
-      }))
-      content.value = {
-        ...content.value,
-        lines: [...content.value.lines, ...nextLines].slice(-5000),
-        totalRead: Math.min(content.value.totalRead + nextLines.length, 5000),
-        size: update.size,
-      }
-    }
+    applyTailUpdate(update)
   } catch (err) {
     setError(err, '实时追踪失败')
     stopTail()
@@ -522,17 +618,32 @@ onUnmounted(() => {
         <button type="button" class="theme-toggle" @click="toggleTheme">
           {{ isDarkMode ? '日间模式' : '黑夜模式' }}
         </button>
-        <button type="button" @click="chooseDirectory">
+        <button v-if="sourceMode === 'local'" type="button" @click="chooseDirectory">
           {{ loadingFiles ? '扫描中...' : '选择目录' }}
         </button>
-        <button type="button" class="secondary" :disabled="!directory || loadingFiles" @click="scanDirectory">
-          重新扫描
+        <button type="button" class="secondary" :disabled="(sourceMode === 'local' && !directory) || loadingFiles" @click="scanDirectory">
+          {{ sourceMode === 'remote' ? '连接 agent' : '重新扫描' }}
         </button>
       </div>
     </header>
 
+    <section class="source-bar">
+      <div class="segmented">
+        <button type="button" :class="{ active: sourceMode === 'local' }" @click="switchSource('local')">本地日志</button>
+        <button type="button" :class="{ active: sourceMode === 'remote' }" @click="switchSource('remote')">远程服务器</button>
+      </div>
+      <template v-if="sourceMode === 'remote'">
+        <input v-model="remoteServer.name" class="server-name-input" type="text" placeholder="环境名称" />
+        <input v-model="remoteServer.address" class="server-address-input" type="text" spellcheck="false" placeholder="http://127.0.0.1:8089" />
+        <input v-model="remoteServer.token" class="server-token-input" type="password" placeholder="Agent Token" @keyup.enter="scanDirectory" />
+        <span class="remote-tip">Agent + WebSocket</span>
+      </template>
+      <span v-else class="remote-tip">目录、拖拽和本地 tail</span>
+    </section>
+
     <section class="control-bar">
       <input
+        v-if="sourceMode === 'local'"
         v-model="directory"
         class="path-input"
         type="text"
@@ -559,7 +670,7 @@ onUnmounted(() => {
       <div class="option-main">
         <div class="segmented">
           <button type="button" :class="{ active: searchScope === 'current' }" @click="searchScope = 'current'">当前文件</button>
-          <button type="button" :class="{ active: searchScope === 'all' }" @click="searchScope = 'all'">全部文件</button>
+          <button type="button" :disabled="sourceMode === 'remote'" :class="{ active: searchScope === 'all' }" @click="searchScope = 'all'">全部文件</button>
         </div>
         <label>
           编码
@@ -582,7 +693,7 @@ onUnmounted(() => {
         <button type="button" class="secondary" :disabled="!activeFile" @click="toggleTail">
           {{ tailing ? '停止 tail' : '实时 tail' }}
         </button>
-        <button type="button" class="ghost" :disabled="!tailing" @click="tailPaused = !tailPaused">
+        <button type="button" class="ghost" :disabled="!tailing" @click="toggleTailPause">
           {{ tailPaused ? '继续' : '暂停' }}
         </button>
       </div>
@@ -614,11 +725,11 @@ onUnmounted(() => {
         <div class="panel-head">
           <div>
             <strong>日志文件</strong>
-            <span>拖入 .log / .txt 或选择目录</span>
+            <span>{{ sourceMode === 'remote' ? remoteServer.name : '拖入 .log / .txt 或选择目录' }}</span>
           </div>
           <span>{{ formatNumber(files.length) }} 个</span>
         </div>
-        <div class="drop-hint">把日志文件拖到这里</div>
+        <div class="drop-hint">{{ sourceMode === 'remote' ? '来自远程 Agent 的日志' : '把日志文件拖到这里' }}</div>
         <div class="file-list">
           <button
             v-for="file in files"
@@ -630,7 +741,7 @@ onUnmounted(() => {
             <span class="file-name">{{ file.name }}</span>
             <span class="file-meta">{{ formatSize(file.size) }} · {{ file.modTime }}</span>
           </button>
-          <div v-if="!files.length" class="empty">还没有扫描到 .log / .txt 文件</div>
+          <div v-if="!files.length" class="empty">{{ sourceMode === 'remote' ? '连接 Agent 后显示远程日志' : '还没有扫描到 .log / .txt 文件' }}</div>
         </div>
       </aside>
 
@@ -856,6 +967,7 @@ button:disabled {
 }
 
 .topbar,
+.source-bar,
 .control-bar,
 .level-tabs,
 .workspace,
@@ -910,6 +1022,35 @@ h1 {
   border-radius: 8px;
   padding: 10px;
   background: var(--control-bg);
+}
+
+.source-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 10px;
+  background: var(--control-bg);
+}
+
+.server-name-input {
+  width: 120px;
+}
+
+.server-address-input {
+  width: 260px;
+}
+
+.server-token-input {
+  width: 160px;
+}
+
+.remote-tip {
+  margin-left: auto;
+  color: var(--brand);
+  font-size: 12px;
+  font-weight: 900;
 }
 
 input {

@@ -21,6 +21,18 @@ export function ListLogFiles(dir: string): $CancellablePromise<$models.LogDirect
     });
 }
 
+export function ListRemoteLogFiles(server: $models.RemoteServer): $CancellablePromise<$models.LogDirectoryResult | null> {
+    return $Call.ByID(2283783740, server).then(($result: any) => {
+        return $$createType3($result);
+    });
+}
+
+export function ReadRemoteTail(server: $models.RemoteServer, path: string, lines: number, encoding: string): $CancellablePromise<$models.LogContentResult | null> {
+    return $Call.ByID(690007, server, path, lines, encoding).then(($result: any) => {
+        return $$createType5($result);
+    });
+}
+
 export function ReadTail(path: string, lines: number, encoding: string): $CancellablePromise<$models.LogContentResult | null> {
     return $Call.ByID(2684180761, path, lines, encoding).then(($result: any) => {
         return $$createType5($result);
@@ -42,6 +54,12 @@ export function SearchInFile(path: string, options: $models.SearchOptions): $Can
 export function SearchInFiles(files: $models.LogFile[], options: $models.SearchOptions): $CancellablePromise<$models.MultiSearchResult | null> {
     return $Call.ByID(3604158787, files, options).then(($result: any) => {
         return $$createType11($result);
+    });
+}
+
+export function SearchRemoteInFile(server: $models.RemoteServer, path: string, options: $models.SearchOptions): $CancellablePromise<$models.SearchResult | null> {
+    return $Call.ByID(879999728, server, path, options).then(($result: any) => {
+        return $$createType9($result);
     });
 }
 
