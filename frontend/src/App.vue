@@ -92,10 +92,30 @@ type RemoteServer = {
   token: string
 }
 
+type RemoteTab = {
+  id: string
+  server: RemoteServer
+  root: string
+  files: LogFile[]
+  warnings: string[]
+  activeFile: LogFile | null
+  content: LogContentResult | null
+  searchResult: SearchResult | null
+  lastSearchOptions: SearchOptions | null
+  loading: boolean
+  loadingContent: boolean
+  error: string
+  tailOffset: number
+}
+
+type StoredRemoteTab = Pick<RemoteTab, 'id' | 'server' | 'root' | 'files' | 'warnings' | 'activeFile'>
+
 type TextPart = {
   text: string
   matched: boolean
 }
+
+const remoteTabsStorageKey = 'wails-log-viewer-remote-tabs'
 
 const directory = ref('')
 const files = ref<LogFile[]>([])
@@ -111,6 +131,7 @@ const caseSensitive = ref(false)
 const useRegex = ref(false)
 const startTime = ref('')
 const endTime = ref('')
+const filtersOpen = ref(false)
 const lastSearchOptions = ref<SearchOptions | null>(null)
 const activeLevel = ref<'all' | LogLine['level']>('all')
 const loadingFiles = ref(false)
@@ -127,18 +148,40 @@ const remoteServer = ref<RemoteServer>({
   address: 'http://127.0.0.1:8089',
   token: 'loglite-demo',
 })
+const remoteTabs = ref<RemoteTab[]>([])
+const activeRemoteTabId = ref('')
+const connectingRemote = ref(false)
 let removeDropListener: (() => void) | null = null
 let tailTimer: number | null = null
 let remoteTailSocket: WebSocket | null = null
 
+const activeRemoteTab = computed(() => remoteTabs.value.find((tab) => tab.id === activeRemoteTabId.value) ?? null)
+
+const currentFiles = computed(() => sourceMode.value === 'remote' ? activeRemoteTab.value?.files ?? [] : files.value)
+const currentWarnings = computed(() => sourceMode.value === 'remote' ? activeRemoteTab.value?.warnings ?? [] : warnings.value)
+const currentActiveFile = computed(() => sourceMode.value === 'remote' ? activeRemoteTab.value?.activeFile ?? null : activeFile.value)
+const currentContent = computed(() => sourceMode.value === 'remote' ? activeRemoteTab.value?.content ?? null : content.value)
+const currentSearchResult = computed(() => sourceMode.value === 'remote' ? activeRemoteTab.value?.searchResult ?? null : searchResult.value)
+const currentMultiSearchResult = computed(() => sourceMode.value === 'remote' ? null : multiSearchResult.value)
+const currentLastSearchOptions = computed(() => sourceMode.value === 'remote' ? activeRemoteTab.value?.lastSearchOptions ?? null : lastSearchOptions.value)
+const currentLoadingFiles = computed(() => sourceMode.value === 'remote' ? connectingRemote.value || Boolean(activeRemoteTab.value?.loading) : loadingFiles.value)
+const currentLoadingContent = computed(() => sourceMode.value === 'remote' ? Boolean(activeRemoteTab.value?.loadingContent) : loadingContent.value)
+const currentError = computed(() => sourceMode.value === 'remote' ? activeRemoteTab.value?.error || error.value : error.value)
+const currentServerName = computed(() => {
+  if (sourceMode.value !== 'remote') return '拖入 .log / .txt 或选择目录'
+  const server = activeRemoteTab.value?.server
+  if (!server) return '未连接远程 Agent'
+  return server.name.trim() || server.address
+})
+
 const selectedLines = computed(() => {
-  const lines = content.value?.lines ?? []
+  const lines = currentContent.value?.lines ?? []
   if (activeLevel.value === 'all') return lines
   return lines.filter((line) => line.level === activeLevel.value)
 })
 
 const visibleHits = computed(() => {
-  const hits = searchResult.value?.hits ?? []
+  const hits = currentSearchResult.value?.hits ?? []
   if (activeLevel.value === 'all') return hits
   return hits
     .map((hit) => ({
@@ -149,7 +192,7 @@ const visibleHits = computed(() => {
 })
 
 const visibleMultiFiles = computed(() => {
-  const items = multiSearchResult.value?.files ?? []
+  const items = currentMultiSearchResult.value?.files ?? []
   if (activeLevel.value === 'all') return items
   return items
     .map((item) => ({
@@ -165,17 +208,17 @@ const visibleMultiFiles = computed(() => {
 })
 
 const statusText = computed(() => {
-  if (!activeFile.value) return '选择目录后点击日志文件'
-  if (multiSearchResult.value) {
-    const limited = multiSearchResult.value.limited ? '，结果已限制' : ''
-    return `搜索 ${formatNumber(multiSearchResult.value.filesScanned)} 个文件，命中 ${formatNumber(multiSearchResult.value.hitCount)} 处${limited}`
+  if (!currentActiveFile.value) return '选择目录后点击日志文件'
+  if (currentMultiSearchResult.value) {
+    const limited = currentMultiSearchResult.value.limited ? '，结果已限制' : ''
+    return `搜索 ${formatNumber(currentMultiSearchResult.value.filesScanned)} 个文件，命中 ${formatNumber(currentMultiSearchResult.value.hitCount)} 处${limited}`
   }
-  if (searchResult.value) {
-    const limited = searchResult.value.limited ? '，已限制展示前 200 条' : ''
-    return `扫描 ${formatNumber(searchResult.value.scanned)} 行，命中 ${formatNumber(searchResult.value.hitCount)} 处${limited}`
+  if (currentSearchResult.value) {
+    const limited = currentSearchResult.value.limited ? '，已限制展示前 200 条' : ''
+    return `扫描 ${formatNumber(currentSearchResult.value.scanned)} 行，命中 ${formatNumber(currentSearchResult.value.hitCount)} 处${limited}`
   }
-  if (content.value?.truncated) return `显示尾部 ${formatNumber(content.value.totalRead)} 行`
-  return `显示 ${formatNumber(content.value?.totalRead ?? 0)} 行`
+  if (currentContent.value?.truncated) return `显示尾部 ${formatNumber(currentContent.value.totalRead)} 行`
+  return `显示 ${formatNumber(currentContent.value?.totalRead ?? 0)} 行`
 })
 
 function formatNumber(value: number) {
@@ -194,7 +237,23 @@ function parentDir(path: string) {
 }
 
 function setError(err: unknown, fallback: string) {
-  error.value = err instanceof Error ? err.message : String(err || fallback)
+  const message = err instanceof Error ? err.message : String(err || fallback)
+  if (sourceMode.value === 'remote' && activeRemoteTab.value) {
+    activeRemoteTab.value.error = message
+  } else {
+    error.value = message
+  }
+}
+
+function clearCurrentError() {
+  if (sourceMode.value === 'remote' && activeRemoteTab.value) {
+    activeRemoteTab.value.error = ''
+  } else {
+    error.value = ''
+  }
+  if (sourceMode.value === 'remote') {
+    error.value = ''
+  }
 }
 
 function applyTheme() {
@@ -220,6 +279,117 @@ function buildSearchOptions(): SearchOptions {
   }
 }
 
+function createRemoteTab(server: RemoteServer, result?: LogDirectoryResult): RemoteTab {
+  return {
+    id: `remote-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    server: {
+      name: server.name.trim(),
+      address: server.address.trim().replace(/\/+$/, ''),
+      token: server.token,
+    },
+    root: result?.root ?? '',
+    files: result?.files ?? [],
+    warnings: result?.warnings ?? [],
+    activeFile: null,
+    content: null,
+    searchResult: null,
+    lastSearchOptions: null,
+    loading: false,
+    loadingContent: false,
+    error: '',
+    tailOffset: 0,
+  }
+}
+
+function tabLabel(tab: RemoteTab) {
+  return tab.server.name.trim() || tab.server.address
+}
+
+function loadRemoteTabs() {
+  try {
+    const raw = localStorage.getItem(remoteTabsStorageKey)
+    if (!raw) return
+    const stored = JSON.parse(raw) as StoredRemoteTab[]
+    if (!Array.isArray(stored)) return
+    remoteTabs.value = stored
+      .filter((tab) => tab?.id && tab.server?.address)
+      .map((tab) => ({
+        id: tab.id,
+        server: tab.server,
+        root: tab.root ?? '',
+        files: tab.files ?? [],
+        warnings: tab.warnings ?? [],
+        activeFile: tab.activeFile ?? null,
+        content: null,
+        searchResult: null,
+        lastSearchOptions: null,
+        loading: false,
+        loadingContent: false,
+        error: '',
+        tailOffset: 0,
+      }))
+    activeRemoteTabId.value = remoteTabs.value[0]?.id ?? ''
+  } catch {
+    localStorage.removeItem(remoteTabsStorageKey)
+  }
+}
+
+function saveRemoteTabs() {
+  const stored: StoredRemoteTab[] = remoteTabs.value.map((tab) => ({
+    id: tab.id,
+    server: tab.server,
+    root: tab.root,
+    files: tab.files,
+    warnings: tab.warnings,
+    activeFile: tab.activeFile,
+  }))
+  localStorage.setItem(remoteTabsStorageKey, JSON.stringify(stored))
+}
+
+function selectRemoteTab(id: string) {
+  if (activeRemoteTabId.value === id) return
+  stopTail()
+  activeRemoteTabId.value = id
+  searchScope.value = 'current'
+}
+
+function closeRemoteTab(id: string) {
+  const index = remoteTabs.value.findIndex((tab) => tab.id === id)
+  if (index < 0) return
+  const isActive = activeRemoteTabId.value === id
+  if (isActive) stopTail()
+  remoteTabs.value.splice(index, 1)
+  if (isActive) {
+    activeRemoteTabId.value = remoteTabs.value[Math.min(index, remoteTabs.value.length - 1)]?.id ?? ''
+  }
+  saveRemoteTabs()
+}
+
+async function connectRemoteServer() {
+  if (connectingRemote.value) return
+  connectingRemote.value = true
+  clearCurrentError()
+  stopTail()
+
+  try {
+    const server = {
+      name: remoteServer.value.name,
+      address: remoteServer.value.address,
+      token: remoteServer.value.token,
+    }
+    const result = (await LogService.ListRemoteLogFiles(server)) as LogDirectoryResult
+    const tab = createRemoteTab(server, result)
+    remoteTabs.value.push(tab)
+    activeRemoteTabId.value = tab.id
+    searchScope.value = 'current'
+    saveRemoteTabs()
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err || '连接 agent 失败')
+  } finally {
+    connectingRemote.value = false
+  }
+}
+
 async function chooseDirectory() {
   error.value = ''
   const selected = await Dialogs.OpenFile({
@@ -239,13 +409,6 @@ async function chooseDirectory() {
 function switchSource(mode: 'local' | 'remote') {
   if (sourceMode.value === mode) return
   sourceMode.value = mode
-  directory.value = ''
-  files.value = []
-  warnings.value = []
-  activeFile.value = null
-  content.value = null
-  searchResult.value = null
-  multiSearchResult.value = null
   stopTail()
   if (mode === 'remote') {
     searchScope.value = 'current'
@@ -253,7 +416,35 @@ function switchSource(mode: 'local' | 'remote') {
 }
 
 async function scanDirectory() {
-  if ((sourceMode.value === 'local' && !directory.value) || loadingFiles.value) return
+  if (sourceMode.value === 'remote') {
+    const tab = activeRemoteTab.value
+    if (!tab || tab.loading) return
+
+    tab.loading = true
+    tab.error = ''
+    tab.activeFile = null
+    tab.content = null
+    tab.searchResult = null
+    tab.lastSearchOptions = null
+    stopTail()
+
+    try {
+      const result = (await LogService.ListRemoteLogFiles(tab.server)) as LogDirectoryResult
+      tab.root = result.root
+      tab.files = result.files
+      tab.warnings = result.warnings ?? []
+      saveRemoteTabs()
+    } catch (err) {
+      tab.files = []
+      tab.warnings = []
+      setError(err, '扫描日志目录失败')
+    } finally {
+      tab.loading = false
+    }
+    return
+  }
+
+  if (!directory.value || loadingFiles.value) return
 
   loadingFiles.value = true
   error.value = ''
@@ -264,9 +455,7 @@ async function scanDirectory() {
   stopTail()
 
   try {
-    const result = sourceMode.value === 'remote'
-      ? (await LogService.ListRemoteLogFiles(remoteServer.value)) as LogDirectoryResult
-      : (await LogService.ListLogFiles(directory.value)) as LogDirectoryResult
+    const result = (await LogService.ListLogFiles(directory.value)) as LogDirectoryResult
     directory.value = result.root
     files.value = result.files
     warnings.value = result.warnings ?? []
@@ -280,20 +469,41 @@ async function scanDirectory() {
 }
 
 async function openFile(file: LogFile) {
-  activeFile.value = file
-  if (sourceMode.value === 'local') {
-    directory.value = parentDir(file.path)
+  const tab = activeRemoteTab.value
+
+  if (sourceMode.value === 'remote') {
+    if (!tab) return
+    tab.activeFile = file
+    tab.content = null
+    tab.searchResult = null
+    tab.lastSearchOptions = null
+    tab.error = ''
+    tab.loadingContent = true
+    stopTail()
+
+    try {
+      tab.content = (await LogService.ReadRemoteTail(tab.server, file.path, 2000, encoding.value)) as LogContentResult
+      tab.tailOffset = tab.content.size
+      saveRemoteTabs()
+    } catch (err) {
+      setError(err, '读取日志失败')
+    } finally {
+      tab.loadingContent = false
+    }
+    return
   }
+
+  activeFile.value = file
+  directory.value = parentDir(file.path)
   content.value = null
   searchResult.value = null
   multiSearchResult.value = null
   error.value = ''
   loadingContent.value = true
+  stopTail()
 
   try {
-    content.value = sourceMode.value === 'remote'
-      ? (await LogService.ReadRemoteTail(remoteServer.value, file.path, 2000, encoding.value)) as LogContentResult
-      : (await LogService.ReadTail(file.path, 2000, encoding.value)) as LogContentResult
+    content.value = (await LogService.ReadTail(file.path, 2000, encoding.value)) as LogContentResult
     tailOffset.value = content.value.size
   } catch (err) {
     setError(err, '读取日志失败')
@@ -347,36 +557,48 @@ async function runSearch() {
   if (searching.value) return
   const hasSearchCondition = Boolean(search.value.trim() || startTime.value.trim() || endTime.value.trim())
   if (!hasSearchCondition) {
-    searchResult.value = null
-    multiSearchResult.value = null
-    lastSearchOptions.value = null
+    if (sourceMode.value === 'remote' && activeRemoteTab.value) {
+      activeRemoteTab.value.searchResult = null
+      activeRemoteTab.value.lastSearchOptions = null
+    } else {
+      searchResult.value = null
+      multiSearchResult.value = null
+      lastSearchOptions.value = null
+    }
     return
   }
-  if (searchScope.value === 'current' && !activeFile.value) return
-  if (searchScope.value === 'all' && !files.value.length) return
+  if (searchScope.value === 'current' && !currentActiveFile.value) return
+  if (searchScope.value === 'all' && !currentFiles.value.length) return
 
   searching.value = true
-  error.value = ''
+  clearCurrentError()
   const options = buildSearchOptions()
 
   try {
-    lastSearchOptions.value = options
-    if (sourceMode.value === 'remote' && activeFile.value) {
-      searchResult.value = (await LogService.SearchRemoteInFile(remoteServer.value, activeFile.value.path, options)) as SearchResult
-      multiSearchResult.value = null
+    if (sourceMode.value === 'remote' && activeRemoteTab.value?.activeFile) {
+      const tab = activeRemoteTab.value
+      const file = tab.activeFile as LogFile
+      tab.lastSearchOptions = options
+      tab.searchResult = (await LogService.SearchRemoteInFile(tab.server, file.path, options)) as SearchResult
     } else if (searchScope.value === 'all') {
+      lastSearchOptions.value = options
       multiSearchResult.value = (await LogService.SearchInFiles(files.value, options)) as MultiSearchResult
       searchResult.value = null
       if (multiSearchResult.value.warnings?.length) {
         warnings.value = multiSearchResult.value.warnings
       }
     } else if (activeFile.value) {
+      lastSearchOptions.value = options
       searchResult.value = (await LogService.SearchInFile(activeFile.value.path, options)) as SearchResult
       multiSearchResult.value = null
     }
   } catch (err) {
-    searchResult.value = null
-    multiSearchResult.value = null
+    if (sourceMode.value === 'remote' && activeRemoteTab.value) {
+      activeRemoteTab.value.searchResult = null
+    } else {
+      searchResult.value = null
+      multiSearchResult.value = null
+    }
     setError(err, '搜索失败')
   } finally {
     searching.value = false
@@ -385,13 +607,18 @@ async function runSearch() {
 
 function clearSearch() {
   search.value = ''
-  searchResult.value = null
-  multiSearchResult.value = null
-  lastSearchOptions.value = null
+  if (sourceMode.value === 'remote' && activeRemoteTab.value) {
+    activeRemoteTab.value.searchResult = null
+    activeRemoteTab.value.lastSearchOptions = null
+  } else {
+    searchResult.value = null
+    multiSearchResult.value = null
+    lastSearchOptions.value = null
+  }
 }
 
 function splitMatchedText(text: string): TextPart[] {
-  const options = lastSearchOptions.value
+  const options = currentLastSearchOptions.value
   const keyword = options?.keyword.trim()
   if (!keyword) return [{ text, matched: false }]
 
@@ -444,7 +671,7 @@ function splitMatchedText(text: string): TextPart[] {
 }
 
 function lineClass(line: LogLine) {
-  const options = lastSearchOptions.value
+  const options = currentLastSearchOptions.value
   if (!options?.keyword) return ['log-line', `level-${line.level}`]
 
   let matched = false
@@ -473,8 +700,8 @@ function matchTitle(hit: SearchHit) {
 }
 
 async function reloadActiveFile() {
-  if (activeFile.value) {
-    await openFile(activeFile.value)
+  if (currentActiveFile.value) {
+    await openFile(currentActiveFile.value)
   }
 }
 
@@ -496,7 +723,7 @@ function toggleTail() {
     stopTail()
     return
   }
-  if (!activeFile.value) return
+  if (!currentActiveFile.value) return
 
   tailing.value = true
   tailPaused.value = false
@@ -523,27 +750,28 @@ function toggleTailPause() {
 }
 
 function startRemoteTail() {
-  if (!activeFile.value) return
-  const address = remoteServer.value.address.trim().replace(/\/+$/, '')
+  const tab = activeRemoteTab.value
+  if (!tab?.activeFile) return
+  const address = tab.server.address.trim().replace(/\/+$/, '')
   const wsAddress = address.replace(/^http:/i, 'ws:').replace(/^https:/i, 'wss:')
   const query = new URLSearchParams({
-    path: activeFile.value.path,
-    offset: String(tailOffset.value),
+    path: tab.activeFile.path,
+    offset: String(tab.tailOffset),
     encoding: encoding.value,
-    token: remoteServer.value.token,
+    token: tab.server.token,
   })
   remoteTailSocket = new WebSocket(`${wsAddress}/api/tail/stream?${query}`)
   remoteTailSocket.onmessage = (event) => {
     const update = JSON.parse(event.data) as TailUpdateResult & { error?: string }
     if (update.error) {
-      error.value = `远程 tail 失败：${update.error}`
+      tab.error = `远程 tail 失败：${update.error}`
       stopTail()
       return
     }
     applyTailUpdate(update)
   }
   remoteTailSocket.onerror = () => {
-    error.value = '远程 tail 连接失败'
+    tab.error = '远程 tail 连接失败'
     stopTail()
   }
   remoteTailSocket.onclose = () => {
@@ -553,25 +781,40 @@ function startRemoteTail() {
 
 function applyTailUpdate(update: TailUpdateResult) {
   if (tailPaused.value) return
-  tailOffset.value = update.size
+  const tab = sourceMode.value === 'remote' ? activeRemoteTab.value : null
+  if (tab) {
+    tab.tailOffset = update.size
+  } else {
+    tailOffset.value = update.size
+  }
   if (update.rotated) {
-    if (activeFile.value) void openFile(activeFile.value)
+    if (currentActiveFile.value) void openFile(currentActiveFile.value)
     return
   }
   if (update.warning) {
-    warnings.value = [update.warning]
+    if (tab) {
+      tab.warnings = [update.warning]
+    } else {
+      warnings.value = [update.warning]
+    }
   }
-  if (update.lines.length && content.value) {
-    const base = content.value.lines.length
+  const targetContent = tab?.content ?? content.value
+  if (update.lines.length && targetContent) {
+    const base = targetContent.lines.length
     const nextLines = update.lines.map((line, index) => ({
       ...line,
       number: base + index + 1,
     }))
-    content.value = {
-      ...content.value,
-      lines: [...content.value.lines, ...nextLines].slice(-5000),
-      totalRead: Math.min(content.value.totalRead + nextLines.length, 5000),
+    const nextContent = {
+      ...targetContent,
+      lines: [...targetContent.lines, ...nextLines].slice(-5000),
+      totalRead: Math.min(targetContent.totalRead + nextLines.length, 5000),
       size: update.size,
+    }
+    if (tab) {
+      tab.content = nextContent
+    } else {
+      content.value = nextContent
     }
   }
 }
@@ -591,6 +834,7 @@ async function pollTail() {
 onMounted(() => {
   isDarkMode.value = localStorage.getItem('wails-log-viewer-theme') === 'dark'
   applyTheme()
+  loadRemoteTabs()
 
   removeDropListener = Events.On('log-files-dropped', (event) => {
     const paths = Array.isArray(event.data) ? event.data.filter((item): item is string => typeof item === 'string') : []
@@ -621,8 +865,8 @@ onUnmounted(() => {
         <button v-if="sourceMode === 'local'" type="button" @click="chooseDirectory">
           {{ loadingFiles ? '扫描中...' : '选择目录' }}
         </button>
-        <button type="button" class="secondary" :disabled="(sourceMode === 'local' && !directory) || loadingFiles" @click="scanDirectory">
-          {{ sourceMode === 'remote' ? '连接 agent' : '重新扫描' }}
+        <button v-if="sourceMode === 'local'" type="button" class="secondary" :disabled="!directory || loadingFiles" @click="scanDirectory">
+          重新扫描
         </button>
       </div>
     </header>
@@ -635,10 +879,27 @@ onUnmounted(() => {
       <template v-if="sourceMode === 'remote'">
         <input v-model="remoteServer.name" class="server-name-input" type="text" placeholder="环境名称" />
         <input v-model="remoteServer.address" class="server-address-input" type="text" spellcheck="false" placeholder="http://127.0.0.1:8089" />
-        <input v-model="remoteServer.token" class="server-token-input" type="password" placeholder="Agent Token" @keyup.enter="scanDirectory" />
-        <span class="remote-tip">Agent + WebSocket</span>
+        <input v-model="remoteServer.token" class="server-token-input" type="password" placeholder="Agent Token" @keyup.enter="connectRemoteServer" />
+        <button type="button" class="secondary" :disabled="connectingRemote" @click="connectRemoteServer">
+          {{ connectingRemote ? '连接中...' : '连接 agent' }}
+        </button>
+        <button type="button" class="ghost" :disabled="!activeRemoteTab || currentLoadingFiles" @click="scanDirectory">
+          {{ activeRemoteTab?.loading ? '刷新中...' : '刷新当前' }}
+        </button>
       </template>
-      <span v-else class="remote-tip">目录、拖拽和本地 tail</span>
+    </section>
+
+    <section v-if="sourceMode === 'remote' && remoteTabs.length" class="remote-tabs" aria-label="远程服务器">
+      <button
+        v-for="tab in remoteTabs"
+        :key="tab.id"
+        type="button"
+        :class="['remote-tab', { active: activeRemoteTabId === tab.id }]"
+        @click="selectRemoteTab(tab.id)"
+      >
+        <span>{{ tabLabel(tab) }}</span>
+        <span type="button" class="tab-close" title="关闭" @click.stop="closeRemoteTab(tab.id)">×</span>
+      </button>
     </section>
 
     <section class="control-bar">
@@ -657,13 +918,13 @@ onUnmounted(() => {
         type="search"
         spellcheck="false"
         placeholder="搜索 error、接口名、订单号"
-        :disabled="searchScope === 'current' && !activeFile"
+        :disabled="searchScope === 'current' && !currentActiveFile"
         @keyup.enter="runSearch"
       />
-      <button type="button" :disabled="(searchScope === 'current' && !activeFile) || (searchScope === 'all' && !files.length) || searching" @click="runSearch">
+      <button type="button" :disabled="(searchScope === 'current' && !currentActiveFile) || (searchScope === 'all' && !currentFiles.length) || searching" @click="runSearch">
         {{ searching ? '搜索中...' : '搜索' }}
       </button>
-      <button type="button" class="ghost" :disabled="!searchResult && !multiSearchResult" @click="clearSearch">清除</button>
+      <button type="button" class="ghost" :disabled="!currentSearchResult && !currentMultiSearchResult" @click="clearSearch">清除</button>
     </section>
 
     <section class="option-bar">
@@ -688,16 +949,24 @@ onUnmounted(() => {
           <input v-model="useRegex" type="checkbox" />
           正则
         </label>
+        <div class="level-filter" aria-label="日志级别">
+          <button type="button" :class="{ active: activeLevel === 'all' }" @click="activeLevel = 'all'">全部</button>
+          <button type="button" :class="{ active: activeLevel === 'error' }" @click="activeLevel = 'error'">ERROR</button>
+          <button type="button" :class="{ active: activeLevel === 'warn' }" @click="activeLevel = 'warn'">WARN</button>
+          <button type="button" :class="{ active: activeLevel === 'info' }" @click="activeLevel = 'info'">INFO</button>
+          <button type="button" :class="{ active: activeLevel === 'debug' }" @click="activeLevel = 'debug'">DEBUG</button>
+        </div>
       </div>
       <div class="tail-actions">
-        <button type="button" class="secondary" :disabled="!activeFile" @click="toggleTail">
+        <button type="button" class="ghost" :class="{ active: filtersOpen }" @click="filtersOpen = !filtersOpen">筛选</button>
+        <button type="button" class="secondary" :disabled="!currentActiveFile" @click="toggleTail">
           {{ tailing ? '停止 tail' : '实时 tail' }}
         </button>
         <button type="button" class="ghost" :disabled="!tailing" @click="toggleTailPause">
           {{ tailPaused ? '继续' : '暂停' }}
         </button>
       </div>
-      <div class="time-row">
+      <div v-if="filtersOpen" class="time-row">
         <label>
           开始时间
           <input v-model="startTime" class="time-input" type="text" placeholder="2026-05-21 10:00:00" @keyup.enter="runSearch" />
@@ -709,56 +978,47 @@ onUnmounted(() => {
       </div>
     </section>
 
-    <section class="level-tabs" aria-label="日志级别">
-      <button type="button" :class="{ active: activeLevel === 'all' }" @click="activeLevel = 'all'">全部</button>
-      <button type="button" :class="{ active: activeLevel === 'error' }" @click="activeLevel = 'error'">ERROR</button>
-      <button type="button" :class="{ active: activeLevel === 'warn' }" @click="activeLevel = 'warn'">WARN</button>
-      <button type="button" :class="{ active: activeLevel === 'info' }" @click="activeLevel = 'info'">INFO</button>
-      <button type="button" :class="{ active: activeLevel === 'debug' }" @click="activeLevel = 'debug'">DEBUG</button>
-    </section>
-
-    <p v-if="error" class="message error">{{ error }}</p>
-    <p v-if="warnings.length" class="message warning">{{ warnings[0] }}</p>
+    <p v-if="currentError" class="message error">{{ currentError }}</p>
+    <p v-if="currentWarnings.length" class="message warning">{{ currentWarnings[0] }}</p>
 
     <section class="workspace">
       <aside id="log-file-drop-zone" class="file-panel" data-file-drop-target>
         <div class="panel-head">
           <div>
-            <strong>日志文件</strong>
-            <span>{{ sourceMode === 'remote' ? remoteServer.name : '拖入 .log / .txt 或选择目录' }}</span>
+            <strong>日志文件 · {{ formatNumber(currentFiles.length) }} 个</strong>
+            <span>{{ currentServerName }}</span>
           </div>
-          <span>{{ formatNumber(files.length) }} 个</span>
         </div>
-        <div class="drop-hint">{{ sourceMode === 'remote' ? '来自远程 Agent 的日志' : '把日志文件拖到这里' }}</div>
+        <div v-if="sourceMode === 'local'" class="drop-hint">把日志文件拖到这里</div>
         <div class="file-list">
           <button
-            v-for="file in files"
+            v-for="file in currentFiles"
             :key="file.path"
             type="button"
-            :class="['file-item', { active: activeFile?.path === file.path }]"
+            :class="['file-item', { active: currentActiveFile?.path === file.path }]"
             @click="openFile(file)"
           >
             <span class="file-name">{{ file.name }}</span>
             <span class="file-meta">{{ formatSize(file.size) }} · {{ file.modTime }}</span>
           </button>
-          <div v-if="!files.length" class="empty">{{ sourceMode === 'remote' ? '连接 Agent 后显示远程日志' : '还没有扫描到 .log / .txt 文件' }}</div>
+          <div v-if="!currentFiles.length" class="empty">{{ sourceMode === 'remote' ? '连接 Agent 后显示远程日志' : '还没有扫描到 .log / .txt 文件' }}</div>
         </div>
       </aside>
 
       <section class="log-panel">
         <div class="panel-head">
           <div>
-            <strong>{{ activeFile?.name ?? '日志内容' }}</strong>
+            <strong>{{ currentActiveFile?.name ?? '日志内容' }}</strong>
             <span>{{ statusText }}</span>
           </div>
-          <span v-if="content?.warning || searchResult?.warning" class="soft-warning">
-            {{ content?.warning || searchResult?.warning }}
+          <span v-if="currentContent?.warning || currentSearchResult?.warning" class="soft-warning">
+            {{ currentContent?.warning || currentSearchResult?.warning }}
           </span>
         </div>
 
-        <div v-if="loadingContent" class="empty fill">正在读取日志...</div>
+        <div v-if="currentLoadingContent" class="empty fill">正在读取日志...</div>
 
-        <div v-else-if="searchResult" class="hit-list">
+        <div v-else-if="currentSearchResult" class="hit-list">
           <article v-for="hit in visibleHits" :key="hit.lineNumber" class="hit-block">
             <div class="hit-title">{{ matchTitle(hit) }}</div>
             <div v-for="line in hit.lines" :key="`${hit.lineNumber}-${line.number}`" :class="resultLineClass(line, hit)">
@@ -774,7 +1034,7 @@ onUnmounted(() => {
           <div v-if="!visibleHits.length" class="empty fill">当前级别筛选下没有命中结果</div>
         </div>
 
-        <div v-else-if="multiSearchResult" class="hit-list">
+        <div v-else-if="currentMultiSearchResult" class="hit-list">
           <article v-for="item in visibleMultiFiles" :key="item.file.path" class="file-hit-block">
             <div class="file-hit-title">
               <strong>{{ item.file.name }}</strong>
@@ -796,7 +1056,7 @@ onUnmounted(() => {
           <div v-if="!visibleMultiFiles.length" class="empty fill">当前筛选下没有多文件命中结果</div>
         </div>
 
-        <div v-else-if="content" class="log-list">
+        <div v-else-if="currentContent" class="log-list">
           <div v-for="line in selectedLines" :key="line.number" :class="lineClass(line)">
             <span class="line-no">{{ line.number }}</span>
             <code>
@@ -930,7 +1190,7 @@ input {
 button {
   border: 0;
   border-radius: 8px;
-  padding: 9px 14px;
+  padding: 8px 12px;
   color: var(--primary-text);
   background: var(--primary-bg);
   font-weight: 800;
@@ -952,6 +1212,11 @@ button:disabled {
   color: var(--ghost-text);
 }
 
+.ghost.active {
+  color: var(--heading);
+  background: var(--tab-active-bg);
+}
+
 .theme-toggle {
   background: var(--ghost-bg);
   color: var(--ghost-text);
@@ -961,15 +1226,15 @@ button:disabled {
   display: flex;
   height: 100vh;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
   overflow: hidden;
-  padding: 22px;
+  padding: 18px 22px 20px;
 }
 
 .topbar,
 .source-bar,
+.remote-tabs,
 .control-bar,
-.level-tabs,
 .workspace,
 .message {
   width: 100%;
@@ -989,9 +1254,9 @@ button:disabled {
 }
 
 .brand img {
-  width: 48px;
-  height: 48px;
-  border-radius: 12px;
+  width: 42px;
+  height: 42px;
+  border-radius: 10px;
   box-shadow: 0 10px 24px rgba(15, 23, 42, 0.18);
 }
 
@@ -1005,13 +1270,12 @@ button:disabled {
 h1 {
   margin: 0;
   color: var(--heading);
-  font-size: 28px;
+  font-size: 26px;
   line-height: 1.18;
 }
 
 .top-actions,
-.control-bar,
-.level-tabs {
+.control-bar {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1020,44 +1284,88 @@ h1 {
 .control-bar {
   border: 1px solid var(--panel-border);
   border-radius: 8px;
-  padding: 10px;
+  padding: 9px;
   background: var(--control-bg);
 }
 
 .source-bar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   border: 1px solid var(--panel-border);
   border-radius: 8px;
-  padding: 10px;
+  padding: 9px;
   background: var(--control-bg);
 }
 
 .server-name-input {
-  width: 120px;
+  width: 128px;
 }
 
 .server-address-input {
-  width: 260px;
+  flex: 1;
+  min-width: 260px;
 }
 
 .server-token-input {
   width: 160px;
 }
 
-.remote-tip {
-  margin-left: auto;
-  color: var(--brand);
-  font-size: 12px;
-  font-weight: 900;
+.remote-tabs {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 8px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.remote-tab {
+  display: inline-flex;
+  min-width: 132px;
+  max-width: 220px;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--input-border);
+  padding: 7px 9px;
+  color: var(--text);
+  background: transparent;
+}
+
+.remote-tab.active {
+  border-color: var(--primary-bg);
+  background: color-mix(in srgb, var(--tab-active-bg) 72%, transparent);
+}
+
+.remote-tab span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-close {
+  display: inline-grid;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.tab-close:hover {
+  color: var(--heading);
+  background: var(--ghost-bg);
 }
 
 input {
   min-width: 0;
   border: 1px solid var(--input-border);
   border-radius: 8px;
-  padding: 9px 11px;
+  padding: 8px 10px;
   color: var(--text);
   background: var(--input-bg);
   outline: none;
@@ -1066,7 +1374,7 @@ input {
 select {
   border: 1px solid var(--input-border);
   border-radius: 8px;
-  padding: 8px 10px;
+  padding: 7px 9px;
   color: var(--text);
   background: var(--input-bg);
   font: inherit;
@@ -1089,10 +1397,10 @@ input:focus {
 .option-bar {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
+  gap: 8px;
   border: 1px solid var(--panel-border);
   border-radius: 8px;
-  padding: 10px;
+  padding: 9px;
   background: var(--control-bg);
 }
 
@@ -1113,8 +1421,8 @@ input:focus {
 }
 
 .option-bar .time-input {
-  width: 178px;
-  padding: 8px 9px;
+  width: 190px;
+  padding: 7px 9px;
 }
 
 .option-main,
@@ -1154,7 +1462,7 @@ input:focus {
 
 .segmented button {
   border-radius: 0;
-  padding: 8px 11px;
+  padding: 7px 10px;
   color: var(--muted);
   background: transparent;
 }
@@ -1164,13 +1472,22 @@ input:focus {
   background: var(--tab-active-bg);
 }
 
-.level-tabs button {
-  padding: 7px 10px;
-  color: var(--muted);
-  background: transparent;
+.level-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  border-left: 1px solid var(--panel-border);
+  padding-left: 8px;
 }
 
-.level-tabs button.active {
+.level-filter button {
+  padding: 6px 8px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 12px;
+}
+
+.level-filter button.active {
   color: var(--heading);
   background: var(--tab-active-bg);
 }
@@ -1196,7 +1513,7 @@ input:focus {
   display: grid;
   flex: 1;
   min-height: 0;
-  grid-template-columns: 320px minmax(0, 1fr);
+  grid-template-columns: 420px minmax(0, 1fr);
   gap: 14px;
   overflow: hidden;
 }
@@ -1211,9 +1528,9 @@ input:focus {
 
 .file-panel {
   position: relative;
-  width: 320px;
-  min-width: 320px;
-  max-width: 320px;
+  width: 420px;
+  min-width: 420px;
+  max-width: 420px;
 }
 
 .file-panel.file-drop-target-active {
@@ -1235,12 +1552,12 @@ input:focus {
 
 .panel-head {
   display: flex;
-  min-height: 58px;
+  min-height: 56px;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   border-bottom: 1px solid var(--panel-border);
-  padding: 12px 14px;
+  padding: 10px 14px;
 }
 
 .panel-head strong {
@@ -1263,11 +1580,11 @@ input:focus {
 
 .drop-hint {
   border-bottom: 1px dashed var(--input-border);
-  padding: 9px 14px;
+  padding: 8px 14px;
   color: var(--muted);
   background: var(--drop-bg);
   font-size: 12px;
-  font-weight: 800;
+  font-weight: 700;
   text-align: center;
 }
 
@@ -1321,7 +1638,7 @@ input:focus {
   width: 100%;
   border-radius: 0;
   border-bottom: 1px solid var(--file-border);
-  padding: 12px 14px;
+  padding: 11px 14px;
   text-align: left;
   color: var(--text);
   background: var(--panel-bg);
@@ -1335,7 +1652,7 @@ input:focus {
 .file-name {
   display: block;
   overflow: hidden;
-  font-weight: 850;
+  font-weight: 780;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1345,7 +1662,7 @@ input:focus {
   margin-top: 5px;
   color: var(--muted);
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .log-list,
