@@ -133,6 +133,7 @@ const startTime = ref('')
 const endTime = ref('')
 const filtersOpen = ref(false)
 const lastSearchOptions = ref<SearchOptions | null>(null)
+const selectedSearchHitKey = ref('')
 const activeLevel = ref<'all' | LogLine['level']>('all')
 const loadingFiles = ref(false)
 const loadingContent = ref(false)
@@ -207,6 +208,11 @@ const visibleMultiFiles = computed(() => {
     .filter((item) => item.hits.length > 0)
 })
 
+const selectedSearchHit = computed(() => {
+  if (!visibleHits.value.length) return null
+  return visibleHits.value.find((hit) => hitKey(hit) === selectedSearchHitKey.value) ?? visibleHits.value[0]
+})
+
 const statusText = computed(() => {
   if (!currentActiveFile.value) return '选择目录后点击日志文件'
   if (currentMultiSearchResult.value) {
@@ -230,6 +236,24 @@ function formatSize(bytes: number) {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
+}
+
+function hitKey(hit: SearchHit) {
+  const matches = hit.matchLines?.length ? hit.matchLines.join('-') : hit.lineNumber
+  return `${hit.lineNumber}:${matches}`
+}
+
+function selectSearchHit(hit: SearchHit) {
+  selectedSearchHitKey.value = hitKey(hit)
+}
+
+function syncSelectedSearchHit() {
+  selectedSearchHitKey.value = currentSearchResult.value?.hits[0] ? hitKey(currentSearchResult.value.hits[0]) : ''
+}
+
+function hitPreview(hit: SearchHit) {
+  const line = hit.lines.find((item) => hit.matchLines?.includes(item.number)) ?? hit.lines[0]
+  return line?.text || ''
 }
 
 function parentDir(path: string) {
@@ -424,8 +448,9 @@ async function scanDirectory() {
     tab.error = ''
     tab.activeFile = null
     tab.content = null
-    tab.searchResult = null
-    tab.lastSearchOptions = null
+      tab.searchResult = null
+      tab.lastSearchOptions = null
+      selectedSearchHitKey.value = ''
     stopTail()
 
     try {
@@ -452,6 +477,7 @@ async function scanDirectory() {
   content.value = null
   searchResult.value = null
   multiSearchResult.value = null
+  selectedSearchHitKey.value = ''
   stopTail()
 
   try {
@@ -565,6 +591,7 @@ async function runSearch() {
       multiSearchResult.value = null
       lastSearchOptions.value = null
     }
+    selectedSearchHitKey.value = ''
     return
   }
   if (searchScope.value === 'current' && !currentActiveFile.value) return
@@ -580,10 +607,12 @@ async function runSearch() {
       const file = tab.activeFile as LogFile
       tab.lastSearchOptions = options
       tab.searchResult = (await LogService.SearchRemoteInFile(tab.server, file.path, options)) as SearchResult
+      syncSelectedSearchHit()
     } else if (searchScope.value === 'all') {
       lastSearchOptions.value = options
       multiSearchResult.value = (await LogService.SearchInFiles(files.value, options)) as MultiSearchResult
       searchResult.value = null
+      selectedSearchHitKey.value = ''
       if (multiSearchResult.value.warnings?.length) {
         warnings.value = multiSearchResult.value.warnings
       }
@@ -591,6 +620,7 @@ async function runSearch() {
       lastSearchOptions.value = options
       searchResult.value = (await LogService.SearchInFile(activeFile.value.path, options)) as SearchResult
       multiSearchResult.value = null
+      syncSelectedSearchHit()
     }
   } catch (err) {
     if (sourceMode.value === 'remote' && activeRemoteTab.value) {
@@ -599,6 +629,7 @@ async function runSearch() {
       searchResult.value = null
       multiSearchResult.value = null
     }
+    selectedSearchHitKey.value = ''
     setError(err, '搜索失败')
   } finally {
     searching.value = false
@@ -615,6 +646,7 @@ function clearSearch() {
     multiSearchResult.value = null
     lastSearchOptions.value = null
   }
+  selectedSearchHitKey.value = ''
 }
 
 function splitMatchedText(text: string): TextPart[] {
@@ -1018,20 +1050,48 @@ onUnmounted(() => {
 
         <div v-if="currentLoadingContent" class="empty fill">正在读取日志...</div>
 
-        <div v-else-if="currentSearchResult" class="hit-list">
-          <article v-for="hit in visibleHits" :key="hit.lineNumber" class="hit-block">
-            <div class="hit-title">{{ matchTitle(hit) }}</div>
-            <div v-for="line in hit.lines" :key="`${hit.lineNumber}-${line.number}`" :class="resultLineClass(line, hit)">
-              <span class="line-no">{{ line.number }}</span>
-              <code>
-                <template v-for="(part, index) in splitMatchedText(line.text)" :key="index">
-                  <mark v-if="part.matched">{{ part.text }}</mark>
-                  <span v-else>{{ part.text }}</span>
-                </template>
-              </code>
+        <div v-else-if="currentSearchResult" class="hit-list search-locator">
+          <aside class="hit-index">
+            <div class="hit-index-head">
+              <strong>命中结果</strong>
+              <span>{{ formatNumber(visibleHits.length) }} 组</span>
             </div>
-          </article>
-          <div v-if="!visibleHits.length" class="empty fill">当前级别筛选下没有命中结果</div>
+            <button
+              v-for="hit in visibleHits"
+              :key="hitKey(hit)"
+              type="button"
+              :class="['hit-index-item', { active: hitKey(selectedSearchHit ?? hit) === hitKey(hit) }]"
+              @click="selectSearchHit(hit)"
+            >
+              <span>{{ matchTitle(hit) }}</span>
+              <small>{{ hitPreview(hit) }}</small>
+            </button>
+            <div v-if="!visibleHits.length" class="empty fill">当前级别筛选下没有命中结果</div>
+          </aside>
+
+          <section class="hit-detail">
+            <template v-if="selectedSearchHit">
+              <div class="hit-detail-head">
+                <div>
+                  <strong>{{ matchTitle(selectedSearchHit) }}</strong>
+                  <span>已定位到命中上下文</span>
+                </div>
+                <span class="context-pill">前后 {{ currentLastSearchOptions?.contextLines ?? 0 }} 行</span>
+              </div>
+              <div class="hit-context">
+                <div v-for="line in selectedSearchHit.lines" :key="`${hitKey(selectedSearchHit)}-${line.number}`" :class="resultLineClass(line, selectedSearchHit)">
+                  <span class="line-no">{{ line.number }}</span>
+                  <code>
+                    <template v-for="(part, index) in splitMatchedText(line.text)" :key="index">
+                      <mark v-if="part.matched">{{ part.text }}</mark>
+                      <span v-else>{{ part.text }}</span>
+                    </template>
+                  </code>
+                </div>
+              </div>
+            </template>
+            <div v-else class="empty fill">当前级别筛选下没有命中结果</div>
+          </section>
         </div>
 
         <div v-else-if="currentMultiSearchResult" class="hit-list">
@@ -1600,20 +1660,26 @@ input:focus {
 
 .file-list::-webkit-scrollbar,
 .log-list::-webkit-scrollbar,
-.hit-list::-webkit-scrollbar {
+.hit-list::-webkit-scrollbar,
+.hit-index::-webkit-scrollbar,
+.hit-context::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 
 .file-list::-webkit-scrollbar-track,
 .log-list::-webkit-scrollbar-track,
-.hit-list::-webkit-scrollbar-track {
+.hit-list::-webkit-scrollbar-track,
+.hit-index::-webkit-scrollbar-track,
+.hit-context::-webkit-scrollbar-track {
   background: transparent;
 }
 
 .file-list::-webkit-scrollbar-thumb,
 .log-list::-webkit-scrollbar-thumb,
-.hit-list::-webkit-scrollbar-thumb {
+.hit-list::-webkit-scrollbar-thumb,
+.hit-index::-webkit-scrollbar-thumb,
+.hit-context::-webkit-scrollbar-thumb {
   border: 2px solid transparent;
   border-radius: 999px;
   background: var(--scrollbar-thumb);
@@ -1622,14 +1688,18 @@ input:focus {
 
 .file-list::-webkit-scrollbar-thumb:hover,
 .log-list::-webkit-scrollbar-thumb:hover,
-.hit-list::-webkit-scrollbar-thumb:hover {
+.hit-list::-webkit-scrollbar-thumb:hover,
+.hit-index::-webkit-scrollbar-thumb:hover,
+.hit-context::-webkit-scrollbar-thumb:hover {
   background: var(--scrollbar-thumb-hover);
   background-clip: padding-box;
 }
 
 .file-list::-webkit-scrollbar-corner,
 .log-list::-webkit-scrollbar-corner,
-.hit-list::-webkit-scrollbar-corner {
+.hit-list::-webkit-scrollbar-corner,
+.hit-index::-webkit-scrollbar-corner,
+.hit-context::-webkit-scrollbar-corner {
   background: transparent;
 }
 
@@ -1736,6 +1806,117 @@ input:focus {
 .hit-block {
   border-bottom: 1px solid var(--log-border);
   padding: 8px 0 10px;
+}
+
+.search-locator {
+  display: grid;
+  grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
+  min-height: 0;
+}
+
+.hit-index {
+  overflow: auto;
+  border-right: 1px solid var(--log-border);
+  background: rgba(15, 23, 42, 0.36);
+}
+
+.hit-index-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px solid var(--log-border);
+  padding: 12px 14px;
+  color: var(--log-text);
+  background: rgba(15, 23, 42, 0.92);
+}
+
+.hit-index-head span {
+  color: var(--line-no);
+  font-size: 12px;
+}
+
+.hit-index-item {
+  display: grid;
+  width: 100%;
+  gap: 6px;
+  border-radius: 0;
+  border-bottom: 1px solid var(--log-border);
+  padding: 12px 14px;
+  color: var(--log-text);
+  text-align: left;
+  background: transparent;
+}
+
+.hit-index-item:hover,
+.hit-index-item.active {
+  background: rgba(8, 145, 178, 0.22);
+}
+
+.hit-index-item.active {
+  box-shadow: inset 3px 0 0 var(--match-line);
+}
+
+.hit-index-item span {
+  color: var(--hit-title);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.hit-index-item small {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--line-no);
+  font-family: "Cascadia Code", Consolas, "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.hit-detail {
+  display: grid;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.hit-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--log-border);
+  padding: 12px 14px;
+  color: var(--log-text);
+  background: rgba(15, 23, 42, 0.52);
+}
+
+.hit-detail-head strong,
+.hit-detail-head span {
+  display: block;
+}
+
+.hit-detail-head span {
+  margin-top: 3px;
+  color: var(--line-no);
+  font-size: 12px;
+}
+
+.context-pill {
+  flex: 0 0 auto;
+  border: 1px solid rgba(125, 211, 252, 0.32);
+  border-radius: 999px;
+  padding: 4px 9px;
+  color: var(--hit-title) !important;
+  background: rgba(14, 165, 233, 0.12);
+  font-weight: 800;
+}
+
+.hit-context {
+  overflow: auto;
 }
 
 .file-hit-block {
